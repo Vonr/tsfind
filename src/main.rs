@@ -7,26 +7,33 @@ use color_eyre::{
 use ignore::{types::TypesBuilder, WalkBuilder};
 use memmap2::Mmap;
 use parking_lot::Mutex;
-use serde::ser::SerializeStruct;
 use std::{
     collections::HashSet,
+    fmt::Write,
     fs::File,
-    io::{BufWriter, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use serde::{Serialize, Serializer};
-use tree_sitter::{Language as TSLanguage, Parser as TSParser, Point, Query, QueryCursor};
+use tree_sitter::{Language as TSLanguage, Parser as TSParser, Query, QueryCursor};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(value_parser = supported_language)]
+    #[arg(value_parser = Language::get)]
     language: Language,
-    query_file: PathBuf,
     paths: Vec<PathBuf>,
+
+    #[arg(short = 'q', long, help = "The query to find matches for", value_parser = unescaper::unescape)]
+    query: Option<String>,
+
+    #[arg(
+        short = 'Q',
+        long,
+        help = "The file containing the query to find matches for"
+    )]
+    query_file: Option<PathBuf>,
 
     #[arg(short = 'H', long, help = "Recurse into hidden files and directories")]
     hidden: bool,
@@ -58,19 +65,21 @@ impl Language {
     pub fn new(name: &'static str, ts_lang: TSLanguage) -> Self {
         Self { ts_lang, name }
     }
-}
 
-fn supported_language(language_name: &str) -> Result<Language> {
-    Ok(match language_name.to_lowercase().as_str() {
-        "rust" => Language::new("rust", tree_sitter_rust::language()),
-        "go" => Language::new("go", tree_sitter_go::language()),
-        "js" | "javascript" => Language::new("js", tree_sitter_javascript::language()),
-        "ts" | "typescript" => Language::new("ts", tree_sitter_typescript::language_typescript()),
-        "tsx" => Language::new("ts", tree_sitter_typescript::language_tsx()),
-        "php" => Language::new("php", tree_sitter_php::language_php()),
-        "phponly" => Language::new("php", tree_sitter_php::language_php_only()),
-        _ => return Err(eyre!("unsupported language")),
-    })
+    pub fn get(language_name: &str) -> Result<Self> {
+        Ok(match language_name.to_lowercase().as_str() {
+            "rust" => Language::new("rust", tree_sitter_rust::language()),
+            "go" => Language::new("go", tree_sitter_go::language()),
+            "js" | "javascript" => Language::new("js", tree_sitter_javascript::language()),
+            "ts" | "typescript" => {
+                Language::new("ts", tree_sitter_typescript::language_typescript())
+            }
+            "tsx" => Language::new("ts", tree_sitter_typescript::language_tsx()),
+            "php" => Language::new("php", tree_sitter_php::language_php()),
+            "phponly" => Language::new("php", tree_sitter_php::language_php_only()),
+            _ => return Err(eyre!("unsupported language")),
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -78,6 +87,7 @@ fn main() -> Result<()> {
 
     let Args {
         language,
+        query,
         query_file,
         mut paths,
         hidden,
@@ -86,25 +96,29 @@ fn main() -> Result<()> {
         separator,
     } = Args::parse();
 
-    let query = match File::open(query_file) {
-        Ok(f) => f,
-        Err(e) => {
-            return Err(eyre!("could not open query file").error(e));
+    let query_src = match (query, query_file) {
+        (None, None) => return Err(eyre!("specify either a query or query file with -q/-Q")),
+        (Some(..), Some(..)) => {
+            return Err(eyre!("only specify one query or query file with -q/-Q"))
         }
+        (Some(query), None) => query.leak(),
+        (None, Some(query_file)) => match File::open(query_file) {
+            Ok(f) => match unsafe { Mmap::map(&f) } {
+                Ok(s) => match s[..].to_str() {
+                    Ok(s) => Box::leak(<Box<str>>::from(s)),
+                    Err(e) => return Err(eyre!("could not read query file").error(e)),
+                },
+                Err(e) => {
+                    return Err(eyre!("could not read query file").error(e));
+                }
+            },
+            Err(e) => {
+                return Err(eyre!("could not open query file").error(e));
+            }
+        },
     };
 
-    let query = match unsafe { Mmap::map(&query) } {
-        Ok(q) => q,
-        Err(e) => {
-            return Err(eyre!("could not read query file").error(e));
-        }
-    };
-
-    let Ok(query_src) = &query[..].to_str() else {
-        return Err(eyre!("query is not UTF-8"));
-    };
-
-    let query = match Query::new(&language.ts_lang, query_src) {
+    let query = match Query::new(&language.ts_lang, &query_src) {
         Ok(q) => q,
         Err(e) => return Err(eyre!("error parsing query").error(e)),
     };
@@ -117,13 +131,14 @@ fn main() -> Result<()> {
             .collect::<Box<[_]>>(),
     );
 
-    let out = Arc::new(Mutex::new(Vec::new()));
+    let out = Arc::new(Mutex::new(String::new()));
     let done = Arc::new(Mutex::new(HashSet::new()));
 
     if paths.is_empty() {
         paths.push("./".into());
     }
-    let num_paths = paths.len();
+
+    let separator = separator.leak() as &'static str;
 
     for path in paths {
         WalkBuilder::new(path)
@@ -135,18 +150,16 @@ fn main() -> Result<()> {
                     .build()?,
             )
             .threads(
-                num_paths.min(
-                    std::thread::available_parallelism()
-                        .map(NonZeroUsize::get)
-                        .unwrap_or(0),
-                ),
+                std::thread::available_parallelism()
+                    .map(NonZeroUsize::get)
+                    .unwrap_or(1),
             )
             .build_parallel()
             .run(|| {
                 let out = out.clone();
                 let done = done.clone();
                 let ts_lang = language.ts_lang.clone();
-                let query = Query::new(&ts_lang, query_src).unwrap();
+                let query = Query::new(&ts_lang, &query_src).unwrap();
                 Box::new(move |file| {
                     use ignore::WalkState::*;
 
@@ -166,37 +179,31 @@ fn main() -> Result<()> {
                     }
 
                     let path: Arc<Path> = file.path().into();
+                    done.lock().insert(path.clone());
                     if let Err(e) = parse(
-                        path.clone(),
+                        path,
                         &mut parser,
                         &query,
                         query_captures,
                         out.clone(),
                         hidden_captures,
+                        only_text,
+                        &separator,
                     ) {
                         eprintln!("{e:?}");
                     }
 
-                    done.lock().insert(path);
                     Continue
                 })
             })
     }
 
-    let mut out = Arc::into_inner(out).unwrap().into_inner();
-    out.sort_unstable_by_key(|c| c.file.clone());
-
-    let stdout = std::io::stdout().lock();
-    let mut writer = BufWriter::new(stdout);
+    let out = Arc::into_inner(out).unwrap().into_inner();
     if only_text {
-        for capture in out {
-            _ = writer.write_all(capture.text.as_bytes());
-            _ = writer.write_all(separator.as_bytes());
-        }
+        println!("{out}");
     } else {
-        serde_json::to_writer_pretty(&mut writer, &out).expect("could not write to stdout");
+        println!("[{out}]");
     }
-    let _ = writer.write_all(b"\n");
 
     Ok(())
 }
@@ -206,8 +213,10 @@ fn parse(
     parser: &mut TSParser,
     query: &Query,
     query_captures: &'static [&'static mut str],
-    out: Arc<Mutex<Vec<Capture>>>,
+    out: Arc<Mutex<String>>,
     hidden_captures: bool,
+    only_text: bool,
+    separator: &'static str,
 ) -> Result<()> {
     let Ok(file) = std::fs::File::open(path.clone()) else {
         return Err(eyre!("{path:?} failed to read file"));
@@ -216,8 +225,7 @@ fn parse(
     let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
         return Err(eyre!("{path:?}: could not read file, skipping"));
     };
-    let buf = &mmap[..];
-    let Ok(buf) = buf.to_str() else {
+    let Ok(buf) = mmap[..].to_str() else {
         // skip this file
         return Ok(());
     };
@@ -241,53 +249,31 @@ fn parse(
                 return Err(eyre!("{path:?}: file contents of are not valid UTF-8"));
             };
 
-            out.lock().push(Capture {
-                file: path.clone(),
-                start: node.start_position(),
-                end: node.end_position(),
-                capture: query_captures[idx],
-                text: text.to_string(),
-            });
+            let mut out = out.lock();
+            if only_text {
+                write!(*out, "{text}{separator}")?;
+            } else {
+                if !out.is_empty() {
+                    out.push(',');
+                }
+
+                let start = node.start_position();
+                let end = node.end_position();
+
+                write!(
+                    *out,
+                    r#"{{"file":{file:?},"start":{{"row":{srow},"column":{scol}}},"end":{{"row":{erow},"column":{ecol}}},"capture":{capture:?},"text":{text:?}}}"#,
+                    file = path.to_string_lossy().trim_start_matches("./"),
+                    srow = start.row,
+                    scol = start.column,
+                    erow = end.row,
+                    ecol = end.column,
+                    capture = query_captures[idx],
+                )?;
+            }
         }
     }
 
     parser.reset();
     Ok(())
-}
-
-struct Capture {
-    file: Arc<Path>,
-    start: Point,
-    end: Point,
-    capture: &'static str,
-    text: String,
-}
-
-impl Serialize for Capture {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut s = serializer.serialize_struct("Capture", 4)?;
-        s.serialize_field("file", &self.file.to_string_lossy())?;
-        s.serialize_field("start", &SerializablePoint(self.start))?;
-        s.serialize_field("end", &SerializablePoint(self.end))?;
-        s.serialize_field("capture", self.capture)?;
-        s.serialize_field("text", self.text.as_str())?;
-        s.end()
-    }
-}
-
-struct SerializablePoint(Point);
-
-impl Serialize for SerializablePoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut s = serializer.serialize_struct("Point", 2)?;
-        s.serialize_field("line", &self.0.row)?;
-        s.serialize_field("column", &self.0.column)?;
-        s.end()
-    }
 }
