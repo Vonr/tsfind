@@ -25,8 +25,8 @@ struct Args {
     language: Language,
     paths: Vec<PathBuf>,
 
-    #[arg(short = 'q', long, help = "The query to find matches for", value_parser = unescaper::unescape)]
-    query: Option<String>,
+    #[arg(short = 'q', long, help = "The query to find matches for")]
+    query: Option<Box<str>>,
 
     #[arg(
         short = 'Q',
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
         (Some(..), Some(..)) => {
             return Err(eyre!("only specify one query or query file with -q/-Q"))
         }
-        (Some(query), None) => query.leak(),
+        (Some(query), None) => Box::leak(query),
         (None, Some(query_file)) => match File::open(query_file) {
             Ok(f) => match unsafe { Mmap::map(&f) } {
                 Ok(s) => match s[..].to_str() {
