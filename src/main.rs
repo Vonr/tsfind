@@ -68,14 +68,21 @@ impl Language {
 
     pub fn get(language_name: &str) -> Result<Self> {
         Ok(match language_name.to_lowercase().as_str() {
+            #[cfg(feature = "rust")]
             "rust" => Language::new("rust", tree_sitter_rust::language()),
+            #[cfg(feature = "go")]
             "go" => Language::new("go", tree_sitter_go::language()),
+            #[cfg(feature = "javascript")]
             "js" | "javascript" => Language::new("js", tree_sitter_javascript::language()),
+            #[cfg(feature = "typescript")]
             "ts" | "typescript" => {
                 Language::new("ts", tree_sitter_typescript::language_typescript())
             }
+            #[cfg(feature = "typescript")]
             "tsx" => Language::new("ts", tree_sitter_typescript::language_tsx()),
+            #[cfg(feature = "php")]
             "php" => Language::new("php", tree_sitter_php::language_php()),
+            #[cfg(feature = "php")]
             "phponly" => Language::new("php", tree_sitter_php::language_php_only()),
             _ => return Err(eyre!("unsupported language")),
         })
