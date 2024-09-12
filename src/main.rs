@@ -5,35 +5,35 @@ use color_eyre::{
     Section,
 };
 use ignore::{types::TypesBuilder, WalkBuilder};
+use language::Language;
 use memmap2::Mmap;
 use parking_lot::Mutex;
+use std::{borrow::Cow, fmt::Write};
 use std::{
-    collections::HashSet,
-    fmt::Write,
-    fs::File,
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    sync::Arc,
+    collections::HashSet, convert::Infallible, fs::File, num::NonZeroUsize,
+    os::unix::ffi::OsStrExt, path::Path, sync::Arc,
 };
+use unescaper::unescape;
 
 use tree_sitter::{Language as TSLanguage, Parser as TSParser, Query, QueryCursor};
+
+mod language;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(value_parser = Language::get)]
     language: Language,
-    paths: Vec<PathBuf>,
+    paths: Vec<Box<Path>>,
 
-    #[arg(short = 'q', long, help = "The query to find matches for")]
-    query: Option<Box<str>>,
+    #[arg(short = 'q', long, help = "The query to find matches for", value_parser = leak_str)]
+    query: Option<&'static str>,
 
     #[arg(
         short = 'Q',
         long,
         help = "The file containing the query to find matches for"
     )]
-    query_file: Option<PathBuf>,
+    query_file: Option<Box<Path>>,
 
     #[arg(short = 'H', long, help = "Recurse into hidden files and directories")]
     hidden: bool,
@@ -44,49 +44,26 @@ struct Args {
     #[arg(short = 't', long, help = "Only report captured text")]
     only_text: bool,
 
+    #[arg(short = 'l', long, help = "Only report files with matches")]
+    list: bool,
+
     #[arg(
         short = 's',
         long,
         help = "Separator for matches, only useful with --only-text/-t",
-        value_parser = unescaper::unescape,
+        value_parser = unescape_and_leak_str,
     )]
-    #[cfg_attr(windows, arg(default_value_t = String::from("\r\n")))]
-    #[cfg_attr(not(windows), arg(default_value_t = String::from("\n")))]
-    separator: String,
+    #[cfg_attr(windows, arg(default_value_t = "\r\n"))]
+    #[cfg_attr(not(windows), arg(default_value_t = "\n"))]
+    separator: &'static str,
 }
 
-#[derive(Clone, Debug)]
-struct Language {
-    name: &'static str,
-    ts_lang: TSLanguage,
+fn leak_str(s: &str) -> Result<&'static str, Infallible> {
+    Ok(Box::<str>::leak(<Box<str>>::from(s)))
 }
 
-impl Language {
-    pub fn new(name: &'static str, ts_lang: TSLanguage) -> Self {
-        Self { ts_lang, name }
-    }
-
-    pub fn get(language_name: &str) -> Result<Self> {
-        Ok(match language_name.to_lowercase().as_str() {
-            #[cfg(feature = "rust")]
-            "rust" => Language::new("rust", tree_sitter_rust::language()),
-            #[cfg(feature = "go")]
-            "go" => Language::new("go", tree_sitter_go::language()),
-            #[cfg(feature = "javascript")]
-            "js" | "javascript" => Language::new("js", tree_sitter_javascript::language()),
-            #[cfg(feature = "typescript")]
-            "ts" | "typescript" => {
-                Language::new("ts", tree_sitter_typescript::language_typescript())
-            }
-            #[cfg(feature = "typescript")]
-            "tsx" => Language::new("ts", tree_sitter_typescript::language_tsx()),
-            #[cfg(feature = "php")]
-            "php" => Language::new("php", tree_sitter_php::language_php()),
-            #[cfg(feature = "php")]
-            "phponly" => Language::new("php", tree_sitter_php::language_php_only()),
-            _ => return Err(eyre!("unsupported language")),
-        })
-    }
+fn unescape_and_leak_str(s: &str) -> Result<&'static str, unescaper::Error> {
+    unescape(s).map(|s| s.leak() as _)
 }
 
 fn main() -> Result<()> {
@@ -100,6 +77,7 @@ fn main() -> Result<()> {
         hidden,
         hidden_captures,
         only_text,
+        list,
         separator,
     } = Args::parse();
 
@@ -108,7 +86,7 @@ fn main() -> Result<()> {
         (Some(..), Some(..)) => {
             return Err(eyre!("only specify one query or query file with -q/-Q"))
         }
-        (Some(query), None) => Box::leak(query),
+        (Some(query), None) => query,
         (None, Some(query_file)) => match File::open(query_file) {
             Ok(f) => match unsafe { Mmap::map(&f) } {
                 Ok(s) => match s[..].to_str() {
@@ -125,16 +103,23 @@ fn main() -> Result<()> {
         },
     };
 
-    let query = match Query::new(&language.ts_lang, &query_src) {
+    if query_src.is_empty() {
+        if !list && !only_text {
+            println!("[]");
+        }
+        return Ok(());
+    }
+
+    let query = match Query::new(&language.ts_lang(), &query_src) {
         Ok(q) => q,
         Err(e) => return Err(eyre!("error parsing query").error(e)),
     };
 
-    let query_captures: &'static [&'static mut str] = Box::leak(
+    let query_captures: &'static [&'static str] = Box::leak(
         query
             .capture_names()
             .iter()
-            .map(|n| n.to_string().leak())
+            .map(|n| n.to_string().leak() as _)
             .collect::<Box<[_]>>(),
     );
 
@@ -142,10 +127,10 @@ fn main() -> Result<()> {
     let done = Arc::new(Mutex::new(HashSet::new()));
 
     if paths.is_empty() {
-        paths.push("./".into());
+        paths.push(Box::from(Path::new("./")));
     }
 
-    let separator = separator.leak() as &'static str;
+    let query = Box::leak(Box::new(query)) as &'static Query;
 
     for path in paths {
         WalkBuilder::new(path)
@@ -153,7 +138,7 @@ fn main() -> Result<()> {
             .types(
                 TypesBuilder::new()
                     .add_defaults()
-                    .select(language.name)
+                    .select(language.name())
                     .build()?,
             )
             .threads(
@@ -165,8 +150,6 @@ fn main() -> Result<()> {
             .run(|| {
                 let out = out.clone();
                 let done = done.clone();
-                let ts_lang = language.ts_lang.clone();
-                let query = Query::new(&ts_lang, &query_src).unwrap();
                 Box::new(move |file| {
                     use ignore::WalkState::*;
 
@@ -174,27 +157,22 @@ fn main() -> Result<()> {
                         return Skip;
                     };
 
+                    let path: Arc<Path> = file.path().into();
                     if !file.file_type().map(|f| f.is_file()).unwrap_or(false)
-                        || done.lock().contains(file.path())
+                        || !done.lock().insert(path.clone())
                     {
                         return Continue;
                     }
 
-                    let mut parser = TSParser::new();
-                    if let Err(e) = parser.set_language(&ts_lang) {
-                        unreachable!("could not create parser: {e:?}");
-                    }
-
-                    let path: Arc<Path> = file.path().into();
-                    done.lock().insert(path.clone());
                     if let Err(e) = parse(
                         path,
-                        &mut parser,
+                        &language.ts_lang(),
                         &query,
                         query_captures,
                         out.clone(),
                         hidden_captures,
                         only_text,
+                        list,
                         &separator,
                     ) {
                         eprintln!("{e:?}");
@@ -206,8 +184,8 @@ fn main() -> Result<()> {
     }
 
     let out = Arc::into_inner(out).unwrap().into_inner();
-    if only_text {
-        println!("{out}");
+    if list || only_text {
+        println!("{}", out.trim_end_matches(separator));
     } else {
         println!("[{out}]");
     }
@@ -217,12 +195,13 @@ fn main() -> Result<()> {
 
 fn parse(
     path: Arc<Path>,
-    parser: &mut TSParser,
+    language: &TSLanguage,
     query: &Query,
-    query_captures: &'static [&'static mut str],
+    query_captures: &[&str],
     out: Arc<Mutex<String>>,
     hidden_captures: bool,
     only_text: bool,
+    list: bool,
     separator: &'static str,
 ) -> Result<()> {
     let Ok(file) = std::fs::File::open(path.clone()) else {
@@ -232,16 +211,21 @@ fn parse(
     let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
         return Err(eyre!("{path:?}: could not read file, skipping"));
     };
+
     let Ok(buf) = mmap[..].to_str() else {
         // skip this file
         return Ok(());
     };
+
+    let mut parser = TSParser::new();
+    parser.set_language(language)?;
 
     let tree = parser.parse(buf, None);
     let Some(tree) = tree else {
         return Err(eyre!("{path:?}: failed to parse file"));
     };
 
+    let mut path_buf: Option<Cow<'_, str>> = None;
     let mut cursor = QueryCursor::new();
 
     for (captures, idx) in cursor.captures(query, tree.root_node(), buf.as_bytes()) {
@@ -249,28 +233,50 @@ fn parse(
             continue;
         }
 
-        let nodes = captures.nodes_for_capture_index(idx as u32);
+        let mut nodes = captures.nodes_for_capture_index(idx as u32);
+        if list && nodes.next().is_some() {
+            let path_bytes = path.as_os_str().as_bytes();
+            write!(
+                out.lock(),
+                "{}{separator}",
+                path_bytes[if path_bytes[..2] == *b"./" { 2 } else { 0 }..].to_str_lossy()
+            )?;
+            return Ok(());
+        }
 
         for node in nodes {
             let Ok(text) = node.utf8_text(buf.as_bytes()) else {
-                return Err(eyre!("{path:?}: file contents of are not valid UTF-8"));
+                return Err(eyre!("{path:?}: file contents are not valid UTF-8"));
             };
 
-            let mut out = out.lock();
             if only_text {
-                write!(*out, "{text}{separator}")?;
+                write!(out.lock(), "{text}{separator}")?;
             } else {
+                let start = node.start_position();
+                let end = node.end_position();
+
+                let path_bytes = path.as_os_str().as_bytes();
+
+                let path_buf = match &path_buf {
+                    Some(p) => p,
+                    None => {
+                        path_buf = Some(
+                            path_bytes[if path_bytes[..2] == *b"./" { 2 } else { 0 }..]
+                                .to_str_lossy(),
+                        );
+                        path_buf.as_ref().unwrap()
+                    }
+                };
+
+                let mut out = out.lock();
                 if !out.is_empty() {
                     out.push(',');
                 }
 
-                let start = node.start_position();
-                let end = node.end_position();
-
                 write!(
-                    *out,
+                    out,
                     r#"{{"file":{file:?},"start":{{"row":{srow},"column":{scol}}},"end":{{"row":{erow},"column":{ecol}}},"capture":{capture:?},"text":{text:?}}}"#,
-                    file = path.to_string_lossy().trim_start_matches("./"),
+                    file = path_buf,
                     srow = start.row,
                     scol = start.column,
                     erow = end.row,
@@ -281,6 +287,5 @@ fn parse(
         }
     }
 
-    parser.reset();
     Ok(())
 }
