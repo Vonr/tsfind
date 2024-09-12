@@ -1,8 +1,14 @@
 [package]
 name = "tsfind"
+description = "Extract code using tree-sitter queries"
 license = "MIT"
 edition = "2021"
-version = "0.2.3"
+version = "0.2.4"
+readme = "README.md"
+homepage = "https://github.com/Vonr/tsfind"
+repository = "https://github.com/Vonr/tsfind"
+keywords = ["command-line", "tree-sitter", "language", "query"]
+include = ["src/**/*", "LICENSE", "README.md"]
 
 [dependencies]
 bstr = "1.10"
