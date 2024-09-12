@@ -3,7 +3,7 @@ name = "tsfind"
 description = "Extract code using tree-sitter queries"
 license = "MIT"
 edition = "2021"
-version = "0.2.4"
+version = "0.2.5"
 readme = "README.md"
 homepage = "https://github.com/Vonr/tsfind"
 repository = "https://github.com/Vonr/tsfind"
@@ -34,4 +34,4 @@ typescript = ["dep:tree-sitter-typescript"]
 php = ["dep:tree-sitter-php"]
 
 [build-dependencies]
-cc = "*"
+cc = "1"
