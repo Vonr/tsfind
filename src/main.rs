@@ -8,7 +8,8 @@ use ignore::{types::TypesBuilder, WalkBuilder};
 use language::Language;
 use memmap2::Mmap;
 use parking_lot::Mutex;
-use std::{borrow::Cow, fmt::Write};
+use std::io::Write;
+use std::{borrow::Cow, io::stdout};
 use std::{
     convert::Infallible, fs::File, num::NonZeroUsize, os::unix::ffi::OsStrExt, path::Path,
     sync::Arc,
@@ -80,6 +81,8 @@ fn main() -> Result<()> {
         separator,
     } = Args::parse();
 
+    let is_json = !list && !only_text;
+
     let query_src = match (query, query_file) {
         (None, None) => return Err(eyre!("specify either a query or query file with -q/-Q")),
         (Some(..), Some(..)) => {
@@ -103,7 +106,7 @@ fn main() -> Result<()> {
     };
 
     if query_src.is_empty() {
-        if !list && !only_text {
+        if is_json {
             println!("[]");
         }
         return Ok(());
@@ -122,7 +125,8 @@ fn main() -> Result<()> {
             .collect::<Box<[_]>>(),
     );
 
-    let out = Arc::new(Mutex::new(String::new()));
+    let out = if is_json { vec![b'['] } else { vec![] };
+    let out = Arc::new(Mutex::new(out));
 
     if paths.is_empty() {
         paths.push(Path::new("./").into());
@@ -182,16 +186,20 @@ fn main() -> Result<()> {
             })
     }
 
-    let out = Arc::into_inner(out).unwrap().into_inner();
-    if list || only_text {
-        if out.is_empty() {
-            return Ok(());
-        }
-
-        println!("{}", out.strip_suffix(separator).unwrap_or(&out));
-    } else {
-        println!("[{out}]");
+    let mut out = Arc::into_inner(out).unwrap().into_inner();
+    if out.is_empty() {
+        return Ok(());
     }
+
+    if is_json {
+        out.push(b']');
+    } else if let Some(stripped) = out.strip_suffix(separator.as_bytes()) {
+        out.truncate(stripped.len())
+    };
+
+    out.push(b'\n');
+
+    stdout().lock().write_all(&out)?;
 
     Ok(())
 }
@@ -201,7 +209,7 @@ fn parse(
     language: &TSLanguage,
     query: &Query,
     query_captures: &[&str],
-    out: Arc<Mutex<String>>,
+    out: Arc<Mutex<Vec<u8>>>,
     hidden_captures: bool,
     only_text: bool,
     list: bool,
@@ -235,14 +243,10 @@ fn parse(
         let mut nodes = captures.nodes_for_capture_index(idx as u32);
         if list && nodes.next().is_some() {
             let path_bytes = path.as_os_str().as_bytes();
-            write!(
-                out.lock(),
-                "{}{separator}",
-                path_bytes
-                    .strip_prefix(b"./")
-                    .unwrap_or(path_bytes)
-                    .to_str_lossy(),
-            )?;
+
+            let mut out = out.lock();
+            out.extend_from_slice(path_bytes.strip_prefix(b"./").unwrap_or(path_bytes));
+            out.extend_from_slice(separator.as_bytes());
             return Ok(());
         }
 
@@ -253,7 +257,9 @@ fn parse(
             };
 
             if only_text {
-                write!(out.lock(), "{text}{separator}")?;
+                let mut out = out.lock();
+                out.extend_from_slice(text.as_bytes());
+                out.extend_from_slice(separator.as_bytes());
                 continue;
             }
 
@@ -269,8 +275,9 @@ fn parse(
             });
 
             let mut out = out.lock();
-            if !out.is_empty() {
-                out.push(',');
+            // out contains b'[' in position 1
+            if out.len() > 1 {
+                out.push(b',');
             }
 
             write!(
