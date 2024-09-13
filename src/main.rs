@@ -10,8 +10,8 @@ use memmap2::Mmap;
 use parking_lot::Mutex;
 use std::{borrow::Cow, fmt::Write};
 use std::{
-    collections::HashSet, convert::Infallible, fs::File, num::NonZeroUsize,
-    os::unix::ffi::OsStrExt, path::Path, sync::Arc,
+    convert::Infallible, fs::File, num::NonZeroUsize, os::unix::ffi::OsStrExt, path::Path,
+    sync::Arc,
 };
 use unescaper::unescape;
 
@@ -119,15 +119,14 @@ fn main() -> Result<()> {
         query
             .capture_names()
             .iter()
-            .map(|n| n.to_string().leak() as _)
+            .map(|&n| Box::leak(<Box<str>>::from(n)) as _)
             .collect::<Box<[_]>>(),
     );
 
     let out = Arc::new(Mutex::new(String::new()));
-    let done = Arc::new(Mutex::new(HashSet::new()));
 
     if paths.is_empty() {
-        paths.push(Box::from(Path::new("./")));
+        paths.push(Path::new("./").into());
     }
 
     let query = Box::leak(Box::new(query)) as &'static Query;
@@ -149,7 +148,6 @@ fn main() -> Result<()> {
             .build_parallel()
             .run(|| {
                 let out = out.clone();
-                let done = done.clone();
                 Box::new(move |file| {
                     use ignore::WalkState::*;
 
@@ -157,23 +155,20 @@ fn main() -> Result<()> {
                         return Skip;
                     };
 
-                    let path: Arc<Path> = file.path().into();
-                    if !file.file_type().map(|f| f.is_file()).unwrap_or(false)
-                        || !done.lock().insert(path.clone())
-                    {
+                    if !file.file_type().map(|f| f.is_file()).unwrap_or(false) {
                         return Continue;
                     }
 
                     if let Err(e) = parse(
-                        path,
+                        file.path(),
                         &language.ts_lang(),
-                        &query,
+                        query,
                         query_captures,
                         out.clone(),
                         hidden_captures,
                         only_text,
                         list,
-                        &separator,
+                        separator,
                     ) {
                         eprintln!("{e:?}");
                     }
@@ -185,7 +180,11 @@ fn main() -> Result<()> {
 
     let out = Arc::into_inner(out).unwrap().into_inner();
     if list || only_text {
-        println!("{}", out.trim_end_matches(separator));
+        if out.is_empty() {
+            return Ok(());
+        }
+
+        println!("{}", out.strip_suffix(separator).unwrap_or(&out));
     } else {
         println!("[{out}]");
     }
@@ -194,7 +193,7 @@ fn main() -> Result<()> {
 }
 
 fn parse(
-    path: Arc<Path>,
+    path: &Path,
     language: &TSLanguage,
     query: &Query,
     query_captures: &[&str],
@@ -202,9 +201,9 @@ fn parse(
     hidden_captures: bool,
     only_text: bool,
     list: bool,
-    separator: &'static str,
+    separator: &str,
 ) -> Result<()> {
-    let Ok(file) = std::fs::File::open(path.clone()) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return Err(eyre!("{path:?} failed to read file"));
     };
 
@@ -239,7 +238,10 @@ fn parse(
             write!(
                 out.lock(),
                 "{}{separator}",
-                path_bytes[if path_bytes[..2] == *b"./" { 2 } else { 0 }..].to_str_lossy()
+                path_bytes
+                    .strip_prefix(b"./")
+                    .unwrap_or(path_bytes)
+                    .to_str_lossy(),
             )?;
             return Ok(());
         }
@@ -261,7 +263,9 @@ fn parse(
                     Some(p) => p,
                     None => {
                         path_buf = Some(
-                            path_bytes[if path_bytes[..2] == *b"./" { 2 } else { 0 }..]
+                            path_bytes
+                                .strip_prefix(b"./")
+                                .unwrap_or(path_bytes)
                                 .to_str_lossy(),
                         );
                         path_buf.as_ref().unwrap()
