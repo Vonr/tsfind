@@ -13,7 +13,6 @@ use std::{
     convert::Infallible, fs::File, num::NonZeroUsize, os::unix::ffi::OsStrExt, path::Path,
     sync::Arc,
 };
-use unescaper::unescape;
 
 use tree_sitter::{Language as TSLanguage, Parser as TSParser, Query, QueryCursor};
 
@@ -63,7 +62,7 @@ fn leak_str(s: &str) -> Result<&'static str, Infallible> {
 }
 
 fn unescape_and_leak_str(s: &str) -> Result<&'static str, unescaper::Error> {
-    unescape(s).map(|s| s.leak() as _)
+    unescaper::unescape(s).map(|s| s.leak() as _)
 }
 
 fn main() -> Result<()> {
@@ -110,7 +109,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let query = match Query::new(&language.ts_lang(), &query_src) {
+    let query = match Query::new(&language.ts_lang(), query_src) {
         Ok(q) => q,
         Err(e) => return Err(eyre!("error parsing query").error(e)),
     };
@@ -129,22 +128,27 @@ fn main() -> Result<()> {
         paths.push(Path::new("./").into());
     }
 
-    let query = Box::leak(Box::new(query)) as &'static Query;
+    let query = Box::leak(Box::new(query)) as &'static _;
+
+    let types = TypesBuilder::new()
+        .add_defaults()
+        .select(language.name())
+        .build()?;
+
+    let threads = std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1);
 
     for path in paths {
         WalkBuilder::new(path)
-            .hidden(hidden)
-            .types(
-                TypesBuilder::new()
-                    .add_defaults()
-                    .select(language.name())
-                    .build()?,
-            )
-            .threads(
-                std::thread::available_parallelism()
-                    .map(NonZeroUsize::get)
-                    .unwrap_or(1),
-            )
+            .parents(!hidden)
+            .hidden(!hidden)
+            .ignore(!hidden)
+            .git_global(!hidden)
+            .git_ignore(!hidden)
+            .git_exclude(!hidden)
+            .types(types.clone())
+            .threads(threads)
             .build_parallel()
             .run(|| {
                 let out = out.clone();
@@ -204,30 +208,26 @@ fn parse(
     separator: &str,
 ) -> Result<()> {
     let Ok(file) = std::fs::File::open(path) else {
-        return Err(eyre!("{path:?} failed to read file"));
+        return Err(eyre!("{path:?}: failed to read file"));
     };
 
     let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
-        return Err(eyre!("{path:?}: could not read file, skipping"));
+        return Err(eyre!("{path:?}: could not memmap file"));
     };
 
-    let Ok(buf) = mmap[..].to_str() else {
-        // skip this file
-        return Ok(());
-    };
+    let src = &mmap[..];
 
     let mut parser = TSParser::new();
     parser.set_language(language)?;
 
-    let tree = parser.parse(buf, None);
-    let Some(tree) = tree else {
+    let Some(tree) = parser.parse(src, None) else {
         return Err(eyre!("{path:?}: failed to parse file"));
     };
 
     let mut path_buf: Option<Cow<'_, str>> = None;
     let mut cursor = QueryCursor::new();
 
-    for (captures, idx) in cursor.captures(query, tree.root_node(), buf.as_bytes()) {
+    for (captures, idx) in cursor.captures(query, tree.root_node(), src) {
         if !hidden_captures && query_captures[idx].starts_with("_") {
             continue;
         }
@@ -247,47 +247,42 @@ fn parse(
         }
 
         for node in nodes {
-            let Ok(text) = node.utf8_text(buf.as_bytes()) else {
-                return Err(eyre!("{path:?}: file contents are not valid UTF-8"));
+            let Ok(text) = node.utf8_text(src) else {
+                eprintln!("{path:?}: found match that is not valid UTF-8");
+                continue;
             };
 
             if only_text {
                 write!(out.lock(), "{text}{separator}")?;
-            } else {
-                let start = node.start_position();
-                let end = node.end_position();
-
-                let path_bytes = path.as_os_str().as_bytes();
-
-                let path_buf = match &path_buf {
-                    Some(p) => p,
-                    None => {
-                        path_buf = Some(
-                            path_bytes
-                                .strip_prefix(b"./")
-                                .unwrap_or(path_bytes)
-                                .to_str_lossy(),
-                        );
-                        path_buf.as_ref().unwrap()
-                    }
-                };
-
-                let mut out = out.lock();
-                if !out.is_empty() {
-                    out.push(',');
-                }
-
-                write!(
-                    out,
-                    r#"{{"file":{file:?},"start":{{"row":{srow},"column":{scol}}},"end":{{"row":{erow},"column":{ecol}}},"capture":{capture:?},"text":{text:?}}}"#,
-                    file = path_buf,
-                    srow = start.row,
-                    scol = start.column,
-                    erow = end.row,
-                    ecol = end.column,
-                    capture = query_captures[idx],
-                )?;
+                continue;
             }
+
+            let start = node.start_position();
+            let end = node.end_position();
+
+            let path_buf = path_buf.get_or_insert_with(|| {
+                let path_bytes = path.as_os_str().as_bytes();
+                path_bytes
+                    .strip_prefix(b"./")
+                    .unwrap_or(path_bytes)
+                    .to_str_lossy()
+            });
+
+            let mut out = out.lock();
+            if !out.is_empty() {
+                out.push(',');
+            }
+
+            write!(
+                out,
+                r#"{{"file":{file:?},"start":{{"row":{srow},"column":{scol}}},"end":{{"row":{erow},"column":{ecol}}},"capture":{capture:?},"text":{text:?}}}"#,
+                file = path_buf,
+                srow = start.row,
+                scol = start.column,
+                erow = end.row,
+                ecol = end.column,
+                capture = query_captures[idx],
+            )?;
         }
     }
 

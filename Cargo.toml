@@ -3,7 +3,7 @@ name = "tsfind"
 description = "Extract code using tree-sitter queries"
 license = "MIT"
 edition = "2021"
-version = "0.2.6"
+version = "0.2.7"
 readme = "README.md"
 homepage = "https://github.com/Vonr/tsfind"
 repository = "https://github.com/Vonr/tsfind"
@@ -11,10 +11,10 @@ keywords = ["command-line", "tree-sitter", "language", "query"]
 include = ["src/**/*", "LICENSE", "README.md"]
 
 [dependencies]
-bstr = "1.10"
+bstr = "1"
 clap = { version = "4.5", features = ["derive"] }
 color-eyre = "0.6.3"
-ignore = { version = "0.4", features = ["simd-accel"] }
+ignore = "0.4"
 memmap2 = "0.9"
 parking_lot = "0.12"
 tree-sitter = "0.23"
