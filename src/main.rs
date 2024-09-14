@@ -50,7 +50,7 @@ struct Args {
     #[arg(
         short = 's',
         long,
-        help = "Separator for matches, only useful with --only-text/-t",
+        help = "Separator for matches. Only useful with --only-text/-t or --list/-l",
         value_parser = unescape_and_leak_str,
     )]
     #[cfg_attr(windows, arg(default_value_t = "\r\n"))]

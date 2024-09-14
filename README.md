@@ -26,7 +26,7 @@ Options:
   -C, --hidden-captures          Show captures starting with '_'
   -t, --only-text                Only report captured text
   -l, --list                     Only report files with matches
-  -s, --separator <SEPARATOR>    Separator for matches, only useful with --only-text/-t [default: "\n"]
+  -s, --separator <SEPARATOR>    Separator for matches. Only useful with --only-text/-t or --list/-l [default: "\n"]
   -h, --help                     Print help
   -V, --version                  Print version
 ```
