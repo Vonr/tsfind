@@ -284,10 +284,10 @@ fn parse(
                 out,
                 r#"{{"file":{file:?},"start":{{"row":{srow},"column":{scol}}},"end":{{"row":{erow},"column":{ecol}}},"capture":{capture:?},"text":{text:?}}}"#,
                 file = path_buf,
-                srow = start.row,
-                scol = start.column,
-                erow = end.row,
-                ecol = end.column,
+                srow = start.row + 1,
+                scol = start.column + 1,
+                erow = end.row + 1,
+                ecol = end.column + 1,
                 capture = query_captures[idx],
             )?;
         }
